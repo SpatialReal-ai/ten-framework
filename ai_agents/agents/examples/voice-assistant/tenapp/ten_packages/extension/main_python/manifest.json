@@ -29,6 +29,12 @@
       "properties": {
         "greeting": {
           "type": "string"
+        },
+        "flush_destinations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     }

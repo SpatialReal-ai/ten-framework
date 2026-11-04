@@ -65,13 +65,21 @@ The extension supports the following configuration options:
 
 ```json
 {
-  "greeting": "Hello there, I'm TEN Agent"
+  "greeting": "Hello there, I'm TEN Agent",
+  "flush_destinations": ["agora_rtc"]
 }
 ```
 
 ### Configuration Parameters
 
 - `greeting` (string, default: "Hello there, I'm TEN Agent"): The greeting message to display when the first user joins
+- `flush_destinations` (non-empty array of extension names, default: `["agora_rtc"]`): Explicit command destinations to flush after interrupting the LLM and TTS. Names are trimmed and duplicate destinations are sent only once, in the configured order. This option requires a version of `main_python` whose config, implementation, and manifest all support it; passing the property to an older version does not enable avatar interruption.
+
+For an avatar graph without an outgoing avatar `flush` route to RTC, configure
+`["avatar", "agora_rtc"]` so the avatar clears its queued audio before RTC is
+flushed. If the graph already forwards the avatar's `flush` command to RTC,
+configure `["avatar"]` to avoid flushing RTC twice. Static routes from
+`main_control` do not add destinations to this explicitly addressed command.
 
 ## Dependencies
 
