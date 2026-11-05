@@ -7,6 +7,7 @@
 #
 from dataclasses import dataclass, field
 import json
+import time
 from typing import AsyncGenerator, List
 from pydantic import BaseModel
 import httpx
@@ -41,6 +42,14 @@ class GeminiLLM2Config(BaseModel):
 
     def is_black_list_params(self, key: str) -> bool:
         return key in self.black_list_params
+
+
+def _created_timestamp(value: object) -> int:
+    # TEN's command-result schema rejects null even though the Python model
+    # allows it. Preserve provider integers and fill missing timestamps.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return int(time.time())
 
 
 class GeminiChatAPI:
@@ -184,94 +193,118 @@ class GeminiChatAPI:
                 f"Requesting chat completions with model: {self.config.model}"
             )
 
-            # Make the API request
-            response = await self.http_client.post(
+            # Read SSE as it arrives; post() buffers the whole response body.
+            # The context also closes the response on cancellation or aclose().
+            async with self.http_client.stream(
+                "POST",
                 "/chat/completions",
                 json=req,
                 params=self._request_params,
                 headers=self._request_headers,
-            )
-
-            if response.status_code != 200:
-                error_text = response.text
-                extra_hint = ""
-                if response.status_code == 404:
-                    extra_hint = (
-                        " (check that the model exists at the configured "
-                        "base_url; Vertex users may need a project-specific "
-                        "endpoint)"
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    error_text = response.text
+                    extra_hint = ""
+                    if response.status_code == 404:
+                        extra_hint = (
+                            " (check that the model exists at the configured "
+                            "base_url; Vertex users may need a project-specific "
+                            "endpoint)"
+                        )
+                    error_msg = (
+                        f"Gemini API error: {response.status_code} - "
+                        f"{error_text}{extra_hint}"
                     )
-                error_msg = (
-                    f"Gemini API error: {response.status_code} - "
-                    f"{error_text}{extra_hint}"
-                )
-                self.ten_env.log_error(error_msg)
-                raise RuntimeError(
-                    f"Gemini API error: {response.status_code} - {error_text}"
-                )
+                    self.ten_env.log_error(error_msg)
+                    raise RuntimeError(
+                        f"Gemini API error: {response.status_code} - {error_text}"
+                    )
 
-            # Handle streaming response
-            if request_input.streaming:
-                async for line in response.aiter_lines():
-                    if not line or line.startswith("data: [DONE]"):
-                        continue
-                    if line.startswith("data: "):
-                        try:
-                            chunk_data = json.loads(line[6:])
-                            if chunk_data.get("choices"):
-                                choice = chunk_data["choices"][0]
-                                delta = choice.get("delta", {})
-                                if delta.get("content"):
-                                    content = delta["content"]
-                                    yield LLMResponseMessageDelta(
-                                        response_id=chunk_data.get("id", ""),
-                                        role="assistant",
-                                        content=content,
-                                        created=chunk_data.get("created", 0),
-                                    )
-                                # Check for tool calls
-                                if delta.get("tool_calls"):
-                                    for tool_call in delta["tool_calls"]:
-                                        function = tool_call.get("function", {})
-                                        yield LLMResponseToolCall(
-                                            response_id=chunk_data.get(
-                                                "id", ""
-                                            ),
-                                            call_id=tool_call.get("id", ""),
-                                            name=function.get("name", ""),
-                                            arguments=function.get(
-                                                "arguments", ""
-                                            ),
-                                        )
-                        except json.JSONDecodeError:
-                            self.ten_env.log_debug(
-                                f"Could not parse line: {line}"
-                            )
+                # Handle streaming response
+                if request_input.streaming:
+                    full_content = ""
+                    response_id = ""
+                    created = int(time.time())
+                    async for line in response.aiter_lines():
+                        if not line:
                             continue
+                        if line.startswith("data: [DONE]"):
+                            break
+                        if line.startswith("data: "):
+                            try:
+                                chunk_data = json.loads(line[6:])
+                                if chunk_data.get("choices"):
+                                    response_id = chunk_data.get("id") or ""
+                                    created = _created_timestamp(
+                                        chunk_data.get("created")
+                                    )
+                                    choice = chunk_data["choices"][0]
+                                    delta = choice.get("delta", {})
+                                    if delta.get("content"):
+                                        content = delta["content"]
+                                        full_content += content
+                                        yield LLMResponseMessageDelta(
+                                            response_id=response_id,
+                                            role="assistant",
+                                            content=full_content,
+                                            delta=content,
+                                            created=created,
+                                        )
+                                    # Check for tool calls
+                                    if delta.get("tool_calls"):
+                                        for tool_call in delta["tool_calls"]:
+                                            function = tool_call.get(
+                                                "function", {}
+                                            )
+                                            yield LLMResponseToolCall(
+                                                response_id=chunk_data.get(
+                                                    "id", ""
+                                                ),
+                                                call_id=tool_call.get("id", ""),
+                                                name=function.get("name", ""),
+                                                arguments=function.get(
+                                                    "arguments", ""
+                                                ),
+                                            )
+                            except json.JSONDecodeError:
+                                self.ten_env.log_debug(
+                                    f"Could not parse line: {line}"
+                                )
+                                continue
 
-                # Send completion message
-                yield LLMResponseMessageDone(
-                    response_id="",
-                    role="assistant",
-                )
-            else:
-                # Non-streaming response
-                response_data = response.json()
-                if response_data.get("choices"):
-                    choice = response_data["choices"][0]
-                    content = choice.get("message", {}).get("content", "")
-                    if content:
-                        yield LLMResponseMessageDelta(
-                            response_id=response_data.get("id", ""),
+                    # Send completion message
+                    yield LLMResponseMessageDone(
+                        response_id=response_id,
+                        role="assistant",
+                        content=full_content,
+                        created=created,
+                    )
+                else:
+                    # Non-streaming response
+                    await response.aread()
+                    response_data = response.json()
+                    if response_data.get("choices"):
+                        response_id = response_data.get("id") or ""
+                        created = _created_timestamp(
+                            response_data.get("created")
+                        )
+                        choice = response_data["choices"][0]
+                        content = choice.get("message", {}).get("content") or ""
+                        if content:
+                            yield LLMResponseMessageDelta(
+                                response_id=response_id,
+                                role="assistant",
+                                content=content,
+                                delta=content,
+                                created=created,
+                            )
+                        yield LLMResponseMessageDone(
+                            response_id=response_id,
                             role="assistant",
                             content=content,
-                            created=response_data.get("created", 0),
+                            created=created,
                         )
-                    yield LLMResponseMessageDone(
-                        response_id=response_data.get("id", ""),
-                        role="assistant",
-                    )
-
         except Exception as e:
             self.ten_env.log_error(f"Error in get_chat_completions: {e}")
             raise RuntimeError(f"CreateChatCompletion failed, err: {e}") from e

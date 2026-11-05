@@ -6,6 +6,8 @@
 #
 #
 import asyncio
+from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
 from ten_ai_base.llm2 import AsyncLLM2BaseExtension
@@ -16,6 +18,7 @@ from ten_ai_base.struct import (
     LLMResponseRetrievePrompt,
 )
 from ten_runtime.async_ten_env import AsyncTenEnv
+from ten_runtime.cmd import Cmd
 
 from .gemini import GeminiChatAPI, GeminiLLM2Config
 
@@ -31,6 +34,9 @@ class GeminiLLM2Extension(AsyncLLM2BaseExtension):
         self.tool_task_future: Optional[asyncio.Future] = None
         self.users_count = 0
         self.last_reasoning_ts = 0
+        self._stream_scope: ContextVar[
+            Optional[tuple[Optional[asyncio.Task], AsyncExitStack]]
+        ] = ContextVar("gemini_response_stream_scope", default=None)
 
     async def on_init(self, ten_env: AsyncTenEnv) -> None:
         ten_env.log_info("on_init")
@@ -78,4 +84,23 @@ class GeminiLLM2Extension(AsyncLLM2BaseExtension):
     def on_call_chat_completion(
         self, async_ten_env: AsyncTenEnv, request_input: LLMRequest
     ) -> AsyncGenerator[LLMResponse, None]:
-        return self.client.get_chat_completions(request_input)
+        stream = self.client.get_chat_completions(request_input)
+        scope = self._stream_scope.get()
+        if scope is not None:
+            owner, stack = scope
+            if owner is asyncio.current_task():
+                stack.push_async_callback(stream.aclose)
+        return stream
+
+    async def _run_stream(
+        self, ten_env: AsyncTenEnv, cmd: Cmd, req: LLMRequest
+    ) -> None:
+        # The registry base awaits return_result after each yielded event.
+        # Cancellation there does not enter the provider generator, so own its
+        # closure here rather than waiting for async-generator garbage collection.
+        async with AsyncExitStack() as stack:
+            token = self._stream_scope.set((asyncio.current_task(), stack))
+            try:
+                await super()._run_stream(ten_env, cmd, req)
+            finally:
+                self._stream_scope.reset(token)
