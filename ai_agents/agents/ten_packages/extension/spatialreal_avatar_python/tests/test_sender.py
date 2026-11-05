@@ -11,11 +11,12 @@ held open for as long as a test needs to queue more behind it.
 """
 
 import asyncio
+import hashlib
 
 import pytest
 
 from spatialreal_avatar_python.pacer import Pacer
-from spatialreal_avatar_python.sender import AudioSender, End, InputQueue
+from spatialreal_avatar_python.sender import AudioSender, End, InputQueue, Turn
 
 pytestmark = pytest.mark.asyncio
 
@@ -234,6 +235,46 @@ async def test_end_waits_for_audio_queued_before_the_session_is_up(clock):
         assert not h.sender.request_open
 
 
+async def test_delayed_initial_session_preserves_26s_source_before_normal_end(
+    clock,
+):
+    """A transport startup retry must not turn a full response into its tail."""
+    sink, log = FakeSink(), FakeLog()
+    pacer = Pacer(sink, RATE, clock=clock.now)
+    sender = AudioSender(pacer, RATE, log)
+    turn = Turn("startup", 0)
+    chunks = [
+        (index + 1).to_bytes(2, "little") * (RATE // 10) for index in range(260)
+    ]
+    task = asyncio.create_task(sender.run())
+    try:
+        sender.put_audio(chunks[0], RATE, turn)
+        await settle()
+        for pcm in chunks[1:]:
+            sender.put_audio(pcm, RATE, turn)
+        sender.put_end(End("tts_audio_end", 1, turn, "tts-request-0"))
+        clock.advance(41_000)
+        await settle()
+        assert sink.calls == []
+
+        sender.session_up()
+        await settle()
+        received = b"".join(sink.audio())
+        expected = b"".join(chunks)
+        assert len(received) == len(expected)
+        assert (
+            hashlib.sha256(received).digest()
+            == hashlib.sha256(expected).digest()
+        )
+        assert sink.ends == 1
+        assert sink.calls[-1] == ("audio", b"", True)
+        assert not log.level("warn")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_tts_audio_end_marker_applies_the_reason_rules(clock):
     async with Harness(clock) as h:
         h.sender.session_up()
@@ -273,6 +314,212 @@ async def test_end_with_nothing_open_is_a_noop(clock):
 # -- flush ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("reason", [1, 2, 3, -1, None])
+async def test_old_turn_end_cannot_close_the_turn_after_flush(clock, reason):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        a, b = Turn("session", 1), Turn("session", 2)
+        h.sender.put_audio(_speech(100), RATE, a)
+        await settle()
+        await h.sender.flush()
+        h.sender.put_audio(_speech(100), RATE, b)
+        h.sender.put_end(End("late A", reason, a, "request-a"))
+        await settle()
+        assert h.sender.request_open
+        assert h.sink.ends == 0
+        h.sender.put_end(End("B", 1, b, "request-b"))
+        await settle()
+        assert not h.sender.request_open
+        assert h.sink.ends == 1
+
+
+async def test_identified_interrupted_end_closes_the_current_turn(clock):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        await h.sender.flush()
+        b = Turn("session", 2)
+        h.sender.put_audio(_speech(100), RATE, b)
+        h.sender.put_end(End("B interrupted", 2, b, "request-b"))
+        await settle()
+        assert not h.sender.request_open
+        assert h.sink.ends == 1
+
+
+async def test_late_cancelled_pcm_cannot_restart_or_contaminate_next_turn(
+    clock,
+):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        a, b = Turn("session", 1), Turn("session", 2)
+        first, cancelled, second = _speech(100), _speech(200), _speech(300)
+        h.sender.put_audio(first, RATE, a)
+        await settle()
+        await h.sender.flush()
+        h.sender.put_audio(cancelled, RATE, a)
+        h.sender.put_audio(second, RATE, b)
+        h.sender.put_audio(cancelled, RATE, a)
+        h.sender.put_end(End("B", 1, b, "request-b"))
+        await settle()
+        assert h.sink.audio() == [first, second]
+        assert h.sink.ends == 1
+
+
+async def test_duplicate_end_does_not_close_another_request_in_the_same_turn(
+    clock,
+):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        turn = Turn("session", 1)
+        h.sender.put_audio(_speech(100), RATE, turn)
+        h.sender.put_end(End("A", 1, turn, "request-a"))
+        await settle()
+        h.sender.put_audio(_speech(200), RATE, turn)
+        h.sender.put_end(End("A duplicate", 1, turn, "request-a"))
+        await settle()
+        h.sleep.release()
+        await settle()
+        assert h.sender.request_open
+        assert h.sink.ends == 1
+        h.sender.put_end(End("B", 1, turn, "request-b"))
+        await settle()
+        assert h.sink.ends == 2
+
+
+async def test_flush_retires_queued_and_inflight_turns(clock):
+    async with Harness(clock) as h:
+        a, b = Turn("session", 1), Turn("session", 2)
+        h.sender.put_audio(_speech(100), RATE, a)
+        h.sender.put_audio(_speech(100), RATE, b)
+        await settle()
+        await h.sender.flush()
+        h.sender.session_up()
+        h.sender.put_audio(_speech(100), RATE, a)
+        h.sender.put_audio(_speech(100), RATE, b)
+        h.sender.put_audio(_speech(300), RATE, Turn("session", 3))
+        await settle()
+        assert h.sink.audio() == [_speech(300)]
+
+
+async def test_new_turn_closes_predecessor_and_ignores_its_late_events(clock):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        a, b = Turn("session", 1), Turn("session", 2)
+        first, second = _speech(100), _speech(200)
+        h.sender.put_audio(first, RATE, a)
+        h.sender.put_audio(second, RATE, b)
+        h.sender.put_audio(_speech(300), RATE, a)
+        h.sender.put_end(End("late A", 1, a, "request-a"))
+        await settle()
+        assert h.sink.calls == [("audio", first, False), ("audio", b"", True)]
+        h.sleep.release()
+        await settle()
+        assert h.sink.audio() == [first, second]
+        assert h.sender.request_open
+        assert h.sink.ends == 1
+        h.sender.put_end(End("B", 1, b, "request-b"))
+        await settle()
+        assert h.sink.ends == 2
+
+
+async def test_turn_zero_in_another_session_survives_flush(clock):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        a, b = Turn("old-session", 0), Turn("new-session", 0)
+        h.sender.put_audio(_speech(100), RATE, a)
+        h.sender.put_end(End("A", 1, a, "request-0"))
+        await settle()
+        await h.sender.flush()
+        h.sender.put_audio(_speech(200), RATE, b)
+        h.sender.put_end(End("B", 1, b, "request-0"))
+        await settle()
+        assert h.sink.audio() == [_speech(100), _speech(200)]
+        assert h.sink.ends == 2
+
+
+async def test_new_turn_waits_until_the_old_interrupt_has_been_sent(clock):
+    class SlowInterrupt(FakeSink):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def interrupt(self):
+            self.started.set()
+            await self.release.wait()
+            return await super().interrupt()
+
+    sink = SlowInterrupt()
+    async with Harness(clock, sink=sink) as h:
+        h.sender.session_up()
+        a, b = Turn("session", 1), Turn("session", 2)
+        first, second = _speech(100), _speech(200)
+        h.sender.put_audio(first, RATE, a)
+        await settle()
+        flushing = asyncio.create_task(h.sender.flush())
+        await asyncio.wait_for(sink.started.wait(), timeout=1)
+        try:
+            h.sender.put_audio(second, RATE, b)
+            h.sender.put_end(End("B", 1, b, "request-b"))
+            await settle()
+            assert sink.audio() == [first]
+        finally:
+            sink.release.set()
+            await asyncio.wait_for(flushing, timeout=1)
+        await settle()
+        assert sink.calls == [
+            ("audio", first, False),
+            ("interrupt",),
+            ("audio", second, False),
+            ("audio", b"", True),
+        ]
+
+
+async def test_unseen_old_turn_first_pcm_cannot_supersede_new_turn(clock):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        await h.sender.flush()  # A has not delivered its first PCM yet.
+        a, b = Turn("session", 1), Turn("session", 2)
+        first, second = _speech(100), _speech(300)
+        h.sender.put_audio(first, RATE, b)
+        # Queue A before B has been processed, to exercise dequeue checks.
+        h.sender.put_audio(_speech(200), RATE, a)
+        h.sender.put_audio(second, RATE, b)
+        h.sender.put_end(End("B", 1, b, "request-b"))
+        await settle()
+        assert h.sink.audio() == [first, second]
+        assert h.sink.ends == 1
+        assert not h.sender.request_open
+
+
+async def test_turn_order_check_preserves_earlier_audio_already_in_queue(clock):
+    async with Harness(clock) as h:
+        h.sender.session_up()
+        a, b = Turn("session", 1), Turn("session", 2)
+        first, second = _speech(100), _speech(200)
+        h.sender.put_audio(first, RATE, a)
+        h.sender.put_end(End("A", 1, a, "request-a"))
+        h.sender.put_audio(second, RATE, b)
+        h.sender.put_end(End("B", 1, b, "request-b"))
+        await settle()
+        assert h.sink.audio() == [first]
+        h.sleep.release()
+        await settle()
+        assert h.sink.audio() == [first, second]
+        assert h.sink.ends == 2
+
+
+@pytest.mark.parametrize(
+    "metadata", [None, [], {}, {"turn_id": True}, {"turn_id": "1"}]
+)
+def test_invalid_turn_metadata_is_unscoped(metadata):
+    assert Turn.from_metadata(metadata) is None
+
+
+def test_turn_zero_and_session_identity_are_preserved():
+    assert Turn.from_metadata({"session_id": "s", "turn_id": 0}) == Turn("s", 0)
+    assert Turn("s", 0) != Turn("another-session", 0)
+
+
 async def test_flush_drops_queued_audio_and_markers(clock):
     async with Harness(clock) as h:
         h.sender.put_audio(_speech(500), RATE)
@@ -294,27 +541,214 @@ async def test_flush_drops_queued_audio_and_markers(clock):
 # -- queue bound ----------------------------------------------------------------
 
 
-async def test_queue_bound_drops_oldest_audio_but_never_a_marker():
+async def test_queue_capacity_rejects_atomically_without_truncating_audio():
     queue = InputQueue(max_ms=1000)
     first, second = _speech(600), _speech(600)
     assert queue.put_audio(first, RATE) is False
     queue.put_end(End("finalize"))
-    assert queue.put_audio(second, RATE) is True
+    with pytest.raises(RuntimeError, match="input queue capacity"):
+        queue.put_audio(second, RATE)
     assert queue.queued_ms == pytest.approx(600.0)
 
-    assert await queue.get() == End("finalize")
     item = await queue.get()
-    assert item.pcm == second
+    assert item.pcm == first
+    assert await queue.get() == End("finalize")
     assert len(queue) == 0
     assert queue.queued_ms == 0.0
 
 
-async def test_sender_warns_once_per_overflow(clock):
+async def test_queue_byte_and_marker_item_bounds_are_atomic():
+    queue = InputQueue(max_bytes=4, max_items=2)
+    with pytest.raises(RuntimeError, match="input queue capacity"):
+        queue.put_audio(b"\x01\x00" * 3, RATE)
+    assert len(queue) == 0
+    queue.put_end(End("first"))
+    queue.put_end(End("second"))
+    with pytest.raises(RuntimeError, match="input queue capacity"):
+        queue.put_end(End("excess"))
+    assert len(queue) == 2
+    assert await queue.get() == End("first")
+    assert await queue.get() == End("second")
+
+
+async def test_sender_capacity_includes_inflight_and_cancels_failed_turn(clock):
+    turn, following = Turn("capacity", 1), Turn("capacity", 2)
     async with Harness(clock, max_queue_ms=1000) as h:
-        for _ in range(4):
-            h.sender.put_audio(_speech(400), RATE)
+        h.sender.put_audio(_speech(600), RATE, turn)
         await settle()
-        assert len(h.log.level("warn")) == 1
+        # The first frame is no longer in the FIFO, but still owns memory.
+        with pytest.raises(RuntimeError, match="input queue capacity") as error:
+            h.sender.put_audio(_speech(600), RATE, turn)
+        assert getattr(error.value, "turn", None) == turn
+        await h.sender.flush()
+        h.sender.put_audio(_speech(200), RATE, turn)
+        h.sender.put_end(End("tts_audio_end", 1, turn, "failed-request"))
+        h.sender.session_up()
+        await settle()
+        assert not h.sink.audio()
+        assert h.sink.ends == 0
+
+        pcm = _speech(200)
+        h.sender.put_audio(pcm, RATE, following)
+        h.sender.put_end(End("tts_audio_end", 1, following, "next-request"))
+        await settle()
+        assert h.sink.audio() == [pcm]
+        assert h.sink.ends == 1
+
+
+async def test_unknown_failed_request_stays_blocked_until_end(clock):
+    async with Harness(clock, max_queue_ms=1000) as h:
+        h.sender.put_audio(_speech(600), RATE)
+        await settle()
+        with pytest.raises(RuntimeError, match="input queue capacity"):
+            h.sender.put_audio(_speech(600), RATE)
+        await h.sender.flush()
+        h.sender.put_audio(_speech(200), RATE)
+        h.sender.session_up()
+        await settle()
+        assert not h.sink.audio()
+        assert h.sink.ends == 0
+        h.sender.put_end(End("tts_audio_end", 1, request_id="failed"))
+        await settle()
+        assert h.sink.ends == 0
+        pcm = _speech(200)
+        h.sender.put_audio(pcm, RATE)
+        await settle()
+        h.sender.put_end(End("tts_audio_end", 1, request_id="failed"))
+        await settle()
+        assert h.sink.ends == 0
+        h.sender.put_end(End("tts_audio_end", 1, request_id="next"))
+        await settle()
+        assert h.sink.audio() == [pcm]
+        assert h.sink.ends == 1
+
+
+async def test_unknown_capacity_failure_can_be_reset_at_stop(clock):
+    async with Harness(clock, max_queue_ms=1000) as h:
+        with pytest.raises(RuntimeError, match="input queue capacity"):
+            h.sender.put_audio(_speech(1200), RATE)
+        await h.sender.flush()
+        h.sender.clear()
+        h.sender.session_up()
+        pcm = _speech(200)
+        h.sender.put_audio(pcm, RATE)
+        h.sender.put_end(End("tts_audio_end", 1))
+        await settle()
+        assert h.sink.audio() == [pcm]
+        assert h.sink.ends == 1
+
+
+async def test_byte_and_item_limits_include_the_inflight_frame(clock):
+    for limits, following in (
+        ({"max_queue_bytes": 8}, "audio"),
+        ({"max_queue_items": 1}, "end"),
+    ):
+        sink, log = FakeSink(), FakeLog()
+        sender = AudioSender(
+            Pacer(sink, RATE, clock=clock.now), RATE, log, **limits
+        )
+        turn = Turn("inflight", 1)
+        task = asyncio.create_task(sender.run())
+        try:
+            sender.put_audio(b"\x01\x00" * 2, RATE, turn)
+            await settle()
+            with pytest.raises(RuntimeError, match="input queue capacity"):
+                if following == "audio":
+                    sender.put_audio(b"\x02\x00" * 3, RATE, turn)
+                else:
+                    sender.put_end(End("tts_audio_end", 1, turn, "failed"))
+            await sender.flush()
+            sender.session_up()
+            await settle()
+            assert not sink.audio()
+            assert sink.ends == 0
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+async def test_clear_releases_cancelled_inflight_admission_budget(clock):
+    sink, log = FakeSink(), FakeLog()
+    sender = AudioSender(
+        Pacer(sink, RATE, clock=clock.now), RATE, log, max_queue_bytes=4
+    )
+    task = asyncio.create_task(sender.run())
+    try:
+        sender.put_audio(b"\x01\x00" * 2, RATE, Turn("reset", 1))
+        await settle()
+        sender.clear()
+        pcm = b"\x02\x00" * 2
+        sender.put_audio(pcm, RATE, Turn("reset", 2))
+        sender.session_up()
+        await settle()
+        assert sink.audio() == [pcm]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_legacy_end_capacity_failure_is_itself_a_request_boundary(clock):
+    sink, log = FakeSink(), FakeLog()
+    sender = AudioSender(
+        Pacer(sink, RATE, clock=clock.now), RATE, log, max_queue_items=1
+    )
+    task = asyncio.create_task(sender.run())
+    try:
+        sender.put_audio(b"\x01\x00", RATE)
+        await settle()
+        with pytest.raises(RuntimeError, match="input queue capacity"):
+            sender.put_end(End("tts_audio_end", 1, request_id="failed"))
+        await sender.flush()
+        sender.session_up()
+        await settle()
+        pcm = b"\x02\x00"
+        sender.put_audio(pcm, RATE)
+        await settle()
+        sender.put_end(End("tts_audio_end", 1, request_id="next"))
+        await settle()
+        assert sink.audio() == [pcm]
+        assert sink.ends == 1
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize("phase", ["queued", "inflight", "active"])
+async def test_mixed_overflow_blocks_cancelled_unknown_audio(clock, phase):
+    async with Harness(clock, max_queue_ms=1000) as h:
+        pcm = _speech(600)
+        if phase == "active":
+            h.sender.session_up()
+        h.sender.put_audio(pcm, RATE)
+        if phase != "queued":
+            await settle()
+        with pytest.raises(RuntimeError, match="input queue capacity"):
+            h.sender.put_audio(
+                _speech(1200 if phase == "active" else 600),
+                RATE,
+                Turn("mixed", 1),
+            )
+        await h.sender.flush()
+        h.sender.put_audio(_speech(200), RATE)
+        h.sender.session_up()
+        await settle()
+        assert h.sink.audio() == ([pcm] if phase == "active" else [])
+        assert h.sink.ends == 0
+        following = Turn("mixed", 2)
+        next_pcm = _speech(100)
+        h.sender.put_audio(next_pcm, RATE, following)
+        await settle()
+        # The cancelled legacy boundary cannot close identified recovery.
+        h.sender.put_end(End("tts_audio_end", 1, request_id="legacy-failed"))
+        await settle()
+        assert h.sink.ends == 0
+        h.sender.put_end(End("tts_audio_end", 1, following, "next"))
+        await settle()
+        assert h.sink.audio()[-1] == next_pcm
+        assert h.sink.ends == 1
 
 
 async def test_flush_drops_the_frame_waiting_at_the_gate(clock):

@@ -17,12 +17,34 @@ black 64x64 picture. Nothing flows back into the graph: the extension emits
 no audio or video frames, only `flush` (forwarded downstream) and `error`.
 
 One SpatialReal request is opened per TTS request: the first `pcm_frame` after
-idle opens it and the first of data `tts_audio_end` (reason `REQUEST_END`,
-`ERROR` or unknown; `INTERRUPTED` only when no `flush` has been processed since
-the request opened) or data `finalize` closes it. End signals are queued in
+idle opens it and data `tts_audio_end` or `finalize` closes it. End signals are queued in
 order behind the audio that preceded them, so a request is closed only after
 all of its audio has been sent. A `flush` command drops the queued audio and
-end signals, interrupts the avatar and continues downstream. Within a request
+end signals, interrupts the avatar and continues downstream.
+
+Preserve `metadata.session_id` and `metadata.turn_id` on both PCM and end
+messages. TEN's TTS PCM carries this metadata, not a standard `request_id`.
+Turn IDs must increase within each session, as in TEN's main controller;
+the sender rejects an older turn even when its first PCM arrives late.
+Different sessions have independent turn counters.
+The sender rejects audio and ends from flushed or superseded turns, and an
+end for another identified turn cannot close the current one. A matching
+`INTERRUPTED` end closes the current request even after an earlier flush.
+The `request_id` on end messages suppresses duplicate ends; completing one
+TTS request does not discard other requests in the same turn. A new identified
+turn closes an unfinished predecessor before its own audio is sent.
+
+Unidentified PCM/end messages remain supported in arrival order. Without a
+shared turn identity, stale events cannot be distinguished: the legacy guard
+ignores `INTERRUPTED` after a flush until an end closes a request. A `finalize`
+without metadata applies to the current request. PCM from two requests in the
+same turn cannot be distinguished by metadata alone; keep each request's PCM
+before its own end and do not interleave those requests.
+If a flush arrives before any identity for the cancelled turn, and that turn's
+first PCM arrives before a newer turn is known, the unscoped flush alone cannot
+identify that PCM as stale. The producer must stop cancelled output.
+
+Within a request
 audio is sent as fast as it arrives; a small amount of silence is inserted when
 the sentence gap would otherwise let the server's playout buffer run dry (see
 Limits). Errors are reported as `ten_ai_base.message.ModuleError` on data
@@ -169,13 +191,28 @@ task check              # black, line length 80
   code `4003`) is reported as `1001` and retried on a slow schedule (30, 60,
   120, 300 s, ten attempts) before the extension gives up with `-1`.
 - Padding: the server auto-ends a request after 400 ms of empty playout
-  buffer, so the extension keeps a virtual playhead and inserts silence when
-  the buffered audio falls below `PAD_FLOOR_MS` (600 ms). Silence costs the
-  same inference time as speech, which is why it is bounded: `PAD_MAX_MS`
+  buffer, so the extension keeps a virtual playhead and inserts 100 ms
+  silence chunks only after the sent audio drains (`PAD_FLOOR_MS`, 0 ms).
+  It leaves positive lead alone: filling a reserve there would splice
+  silence between speech chunks that arrive in time. Silence costs the same
+  inference time as speech, which is why it is bounded: `PAD_MAX_MS`
   (3000 ms of contiguous padding) closes the request, and `TURN_STALL_MS`
-  (15 s) closes a request that is open but never saw audio. All four are
-  constants in `pacer.py`.
-- Audio that arrives while the session is down is queued for at most 10 s of
-  playout time; older frames are dropped with one warning.
+  (15 s after real audio drains) is the outer backstop. These are constants
+  in `pacer.py`.
+- Pending input is preserved in RAM within three hard limits: 120 s of PCM,
+  16 MiB of PCM bytes, and 4096 audio/end items, including the item waiting
+  for a connection or the previous request's gate. A 26 s TTS response can
+  therefore survive a slow initial connection without a missing middle.
+  These are retained-input limits, not a wall-clock reconnect deadline or
+  a bound on total process RSS; resampling and transport also use buffers.
+- Admission beyond any input limit cancels buffered speech and emits a
+  nonfatal avatar error with vendor category `InputQueueOverflow`. It never
+  discards old PCM and then reports a normally completed shortened answer.
+  Identified failed turns stay retired; fresh turns can proceed after the
+  interrupt completes. Older graphs without turn metadata discard that
+  failed request until its ordered End or a stop/reset. If that End has a
+  `request_id`, duplicates cannot close a following request; an unidentified
+  End without any request ID cannot be distinguished from a new boundary.
+  No input PCM is spilled to disk.
 - A session is billed on connection time and holds one concurrency slot for as
   long as the extension runs, idle reconnects included.

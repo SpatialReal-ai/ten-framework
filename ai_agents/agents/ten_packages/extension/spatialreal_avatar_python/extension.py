@@ -44,7 +44,7 @@ from ten_ai_base.utils import encrypt  # pylint: disable=import-error
 
 from .config import ResolvedConfig, resolve_config
 from .pacer import Pacer
-from .sender import AudioSender, End
+from .sender import AudioSender, End, QueueCapacityError, Turn
 from .session_client import (
     CODE_CONFIG,
     CODE_FATAL,
@@ -211,7 +211,16 @@ class SpatialRealAvatarExtension(AsyncExtension):
             if data_name == "tts_audio_end":
                 self._on_tts_audio_end(ten_env, data)
             elif data_name == "finalize":
-                self.sender.put_end(End("finalize"))
+                payload = _payload(data)
+                self.sender.put_end(
+                    End(
+                        "finalize",
+                        turn=Turn.from_metadata(payload.get("metadata")),
+                        request_id=_request_id(payload),
+                    )
+                )
+        except QueueCapacityError as exc:
+            await self._handle_queue_capacity(exc)
         except Exception:
             ten_env.log_error(f"on_data {data_name}: {traceback.format_exc()}")
 
@@ -223,6 +232,7 @@ class SpatialRealAvatarExtension(AsyncExtension):
         try:
             buf = audio_frame.get_buf()
             rate = audio_frame.get_sample_rate()
+            turn = Turn.from_metadata(_payload(audio_frame, "metadata"))
         except Exception:
             ten_env.log_error(f"audio frame: {traceback.format_exc()}")
             return
@@ -230,7 +240,35 @@ class SpatialRealAvatarExtension(AsyncExtension):
             return
         if rate <= 0 and self.config is not None:
             rate = self.config.sample_rate
-        self.sender.put_audio(bytes(buf), rate)
+        try:
+            self.sender.put_audio(bytes(buf), rate, turn)
+        except QueueCapacityError as exc:
+            await self._handle_queue_capacity(exc)
+
+    async def _handle_queue_capacity(self, error: QueueCapacityError) -> None:
+        """Fail closed before yielding; never acknowledge a shortened turn."""
+        turn = error.turn
+        try:
+            try:
+                if self.sender is not None:
+                    # flush retires and clears synchronously before its first
+                    # await, so subsequent hooks cannot race old PCM/end past it.
+                    await self.sender.flush()
+            except Exception:
+                self.ten_env.log_error("input queue overflow: interrupt failed")
+            if not self._stopping:
+                await self._send_error(
+                    CODE_NON_FATAL,
+                    "InputQueueOverflow",
+                    f"{error}; buffered speech cancelled",
+                    session_id=turn.session_id if turn is not None else None,
+                    turn_id=turn.turn_id if turn is not None else None,
+                )
+        except asyncio.CancelledError:
+            # TEN treats an uncaught BaseException in a hook as process fatal.
+            # Cancellation already retired the old turn; stopping must neither
+            # kill the worker nor manufacture a successful normal end.
+            return
 
     # -- request signals ----------------------------------------------------
 
@@ -246,14 +284,13 @@ class SpatialRealAvatarExtension(AsyncExtension):
             # The pacer treats an unknown reason as "close"; keep what came
             # in out of the arithmetic and log it as such.
             reason = -1
-        request_id = payload.get("request_id", "")
-        metadata = payload.get("metadata") or {}
-        turn_id = metadata.get("turn_id")
-        if isinstance(turn_id, int) and not isinstance(turn_id, bool):
-            self._turn_id = turn_id
+        request_id = _request_id(payload)
+        turn = Turn.from_metadata(payload.get("metadata"))
+        if turn is not None:
+            self._turn_id = turn.turn_id
         label = f"tts_audio_end request_id={request_id} reason={reason}"
         ten_env.log_debug(f"queued end: {label}")
-        self.sender.put_end(End(label, tts_reason=reason))
+        self.sender.put_end(End(label, reason, turn, request_id))
 
     # -- session callbacks --------------------------------------------------
 
@@ -287,6 +324,7 @@ class SpatialRealAvatarExtension(AsyncExtension):
         vendor_code: str,
         message: str,
         session_id: Optional[str] = None,
+        turn_id: Optional[int] = None,
     ) -> None:
         """Emit the D8 ``ModuleError`` on data ``error``.
 
@@ -298,7 +336,7 @@ class SpatialRealAvatarExtension(AsyncExtension):
         if session_id is None:
             session_id = self.client.connection_id if self.client else ""
         error = ModuleError(
-            id=str(self._turn_id or 0),
+            id=str(turn_id if turn_id is not None else self._turn_id or 0),
             module=ModuleType.AVATAR.value,
             code=code,
             message=message,
@@ -340,8 +378,13 @@ class SpatialRealAvatarExtension(AsyncExtension):
         return task
 
 
-def _payload(data: Data) -> dict:
-    json_str, _ = data.get_property_to_json(None)
+def _request_id(payload: dict) -> str:
+    value = payload.get("request_id", "")
+    return value if isinstance(value, str) else ""
+
+
+def _payload(data, path=None) -> dict:
+    json_str, _ = data.get_property_to_json(path)
     if not json_str:
         return {}
     try:

@@ -18,9 +18,10 @@ idempotent.
 Padding keeps egress's playout buffer from running dry inside a request:
 the virtual playhead is ``ahead_ms = sent_ms - (now - first_send)`` and a
 tick sends enough 100 ms silence chunks to return it to ``pad_floor_ms``
-whenever it dips below. ``pad_max_ms`` of contiguous padding with no new
-real audio closes the request; ``turn_stall_ms`` after the real audio
-drained is the outer backstop.
+(zero by default) only after it dips below. Positive lead is left alone so
+the next speech chunk can follow without inserted silence.
+``pad_max_ms`` of contiguous padding with no new real audio closes the
+request; ``turn_stall_ms`` after the real audio drained is the outer backstop.
 
 A new request whose predecessor is still less than ``gate_ms`` past drained
 waits before its first chunk so the predecessor's tail is not cut by the
@@ -44,7 +45,9 @@ from typing import Awaitable, Callable, Optional, Protocol
 
 from .audio import duration_ms, silence
 
-PAD_FLOOR_MS = 600
+# Refill only after the virtual playhead drains. A positive reserve inserts
+# silence between speech chunks even when the next chunk arrives in time.
+PAD_FLOOR_MS = 0
 PAD_TICK_MS = 100
 PAD_MAX_MS = 3000
 TURN_STALL_MS = 15000
@@ -127,6 +130,9 @@ class Pacer:
         # Bumped by every flush; a gate wait that started under an older
         # value was cancelled by it.
         self._cancel_gen = 0
+        # An awaited send may finish after end, flush or reconnect and after
+        # a new request has opened. Its accounting belongs only to its epoch.
+        self._request_gen = 0
 
     # -- observable state ---------------------------------------------------
 
@@ -177,6 +183,7 @@ class Pacer:
 
     def _open(self) -> None:
         now = self._clock()
+        self._request_gen += 1
         self._req_open = True
         self._first_send = now
         self._sent_ms = 0.0
@@ -226,6 +233,7 @@ class Pacer:
         del reason  # the caller logs it; the pacer keeps no history
         if not self._req_open:
             return False
+        self._request_gen += 1
         self._req_open = False
         self._padded_ms_contiguous = 0.0
         # An end signal closes the window in which a late reason 2 could
@@ -254,6 +262,7 @@ class Pacer:
         self._flush_seen = True
         self._gate_waiver = True
         self._cancel_gen += 1
+        self._request_gen += 1
         self._gate_abort.set()
         if self._req_open:
             self._req_open = False
@@ -266,22 +275,22 @@ class Pacer:
         """One padding/stall step; ``run`` calls it every ``pad_tick_ms``."""
         if not self._req_open:
             return
+        gen = self._request_gen
         now = self._clock()
         if self._stalled(now):
             await self.end_request("turn stall")
             return
-        # A microsecond of tolerance: float drift in (now - first_send)
-        # otherwise makes a playhead sitting exactly on the floor look one
-        # whole chunk short.
-        deficit_ms = self._pad_floor_ms - self.ahead_ms - _EPS_MS
-        if deficit_ms <= 0:
-            return
-        chunks = math.ceil(deficit_ms / self._pad_tick_ms)
-        for _ in range(chunks):
-            if not self._req_open:
+        while self._req_open and gen == self._request_gen:
+            # Real audio can arrive during an awaited padding send. Recheck
+            # its lead before each chunk instead of sending a stale batch.
+            # The tolerance avoids an extra chunk from float clock drift.
+            deficit_ms = self._pad_floor_ms - self.ahead_ms - _EPS_MS
+            if deficit_ms <= 0:
                 return
             if not await self._sink.send_audio(self._pad_chunk, end=False):
                 # Session gone; the reset that follows forgets the request.
+                return
+            if gen != self._request_gen:
                 return
             self._sent_ms += self._pad_tick_ms
             self._padded_ms_contiguous += self._pad_tick_ms
@@ -317,6 +326,7 @@ class Pacer:
 
     def _forget_request(self) -> None:
         """No request and no playhead: the server-side state is gone."""
+        self._request_gen += 1
         self._req_open = False
         self._first_send = None
         self._sent_ms = 0.0
