@@ -10,6 +10,7 @@ TEN_TEST_MAIN_ROOT optionally selects an installed main_python package; by
 default the tracked voice-assistant example in this repository is used.
 """
 
+from contextlib import asynccontextmanager
 import importlib
 import importlib.util
 import json
@@ -19,6 +20,9 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
+
+# Exercise real producer/consumer internals at the native command boundary.
+# pylint: disable=protected-access
 
 import ten_ai_base
 from ten_ai_base.llm2 import AsyncLLM2BaseExtension
@@ -81,6 +85,9 @@ class SyntheticResponse:
             yield "data: " + json.dumps(chunk)
         yield "data: [DONE]"
 
+    async def aread(self):
+        return json.dumps(self.body).encode()
+
     def json(self):
         return self.body
 
@@ -89,8 +96,9 @@ class SyntheticHTTPClient:
     def __init__(self, response):
         self.response = response
 
-    async def post(self, *_args, **_kwargs):
-        return self.response
+    @asynccontextmanager
+    async def stream(self, *_args, **_kwargs):
+        yield self.response
 
 
 class SchemaRejection:

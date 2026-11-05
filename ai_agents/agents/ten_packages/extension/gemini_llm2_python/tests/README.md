@@ -16,3 +16,8 @@ PYTHONPATH="$TEN_TEST_APP/ten_packages/system/ten_ai_base/interface:$TEN_TEST_AP
 Without it, the tests load the tracked voice-assistant example. The tests cover
 streaming text accumulation, complete non-streaming text, empty streams, and
 missing or null completion timestamps; they do not require a running agent.
+
+The HTTP streaming regression uses a real `httpx.AsyncClient` with a gated
+synthetic byte stream. It requires the first delta before provider EOF, checks
+explicit stream completion, and verifies response cleanup on cancellation,
+consumer close and HTTP errors, plus recovery of a subsequent request.
