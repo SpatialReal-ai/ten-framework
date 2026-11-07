@@ -233,6 +233,7 @@ async def run_bridge(response):
     executor.available_tools = []
     executor.current_request_id = None
     executor.current_text = None
+    executor._request_generation = 0
     executor.tool_registry = {}
     executor.on_response = on_response
     executor.on_reasoning_response = None
