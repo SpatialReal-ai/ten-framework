@@ -175,6 +175,7 @@ def make_api(bridge, response):
         temperature=0.7,
         top_p=0.9,
         max_tokens=100,
+        reasoning_effort=None,
         is_black_list_params=lambda _key: False,
     )
     api.http_client = SyntheticHTTPClient(response)
@@ -232,6 +233,7 @@ async def run_bridge(response):
     executor.available_tools = []
     executor.current_request_id = None
     executor.current_text = None
+    executor._request_generation = 0
     executor.tool_registry = {}
     executor.on_response = on_response
     executor.on_reasoning_response = None

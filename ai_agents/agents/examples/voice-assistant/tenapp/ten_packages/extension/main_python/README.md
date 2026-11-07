@@ -38,6 +38,25 @@ The `main_python` extension acts as the orchestrator for AI agent conversations,
 }
 ```
 
+For Deepgram Nova (`metadata.asr_info.vendor = "deepgram"` and
+`api = "listen_v1"`), `final` marks a stable transcript **segment**, not a
+completed user turn. The controller joins finalized segments per session until
+`speech_final = true`, including an empty endpoint result. Interim transcripts
+replace only the live suffix. The first qualifying speech result interrupts the
+assistant immediately; one endpoint creates one LLM request. Other ASR providers
+and Deepgram Flux retain their existing `final` contract.
+
+Unfinished Nova utterances are bounded to 256 finalized segments and 32,768
+characters, with at most eight retained sessions. Overflow discards that whole
+utterance until its actual endpoint and emits a warning without transcript text;
+the next utterance can proceed. User leave and stop clear unfinished state. This
+consumer does not synthesize an endpoint from silence timers or punctuation.
+This Nova path requires provider endpointing to be enabled so that `speech_final`
+is emitted (the demo uses Deepgram's enabled default). If that boundary is absent,
+locked/finalized segments are not promoted to a fabricated utterance EOF.
+`UtteranceEnd` is not currently forwarded by the Nova provider adapter and is not
+used as an implicit fallback here.
+
 ### Output Data
 
 #### Text Data

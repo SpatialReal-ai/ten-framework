@@ -50,7 +50,11 @@ class LLMExec:
         ] = None
         self.current_task: Optional[asyncio.Task] = None
         self.loop = asyncio.get_event_loop()
-        self.loop.create_task(self._process_input_queue())
+        self._request_generation = 0
+        self._flush_lock = asyncio.Lock()
+        self._flush_complete = asyncio.Event()
+        self._flush_complete.set()
+        self._input_task = self.loop.create_task(self._process_input_queue())
         self.available_tools: list[LLMToolMetadata] = []
         self.tool_registry: dict[str, str] = {}
         self.available_tools_lock = (
@@ -61,32 +65,48 @@ class LLMExec:
         self.current_text = None
 
     async def queue_input(self, item: str) -> None:
-        await self.input_queue.put(item)
+        await self._flush_complete.wait()
+        if not self.stopped:
+            await self.input_queue.put((self._request_generation, item))
 
     async def flush(self) -> None:
-        """
-        Flush the input queue to ensure all items are processed.
-        This is useful for ensuring that all pending inputs are handled before stopping.
-        """
-        await self.input_queue.flush()
-        if self.current_request_id:
-            request_id = self.current_request_id
+        """Retire the current generation before aborting and await its cleanup."""
+        async with self._flush_lock:
+            self._flush_complete.clear()
+            self._request_generation += 1
+            task, request_id = self.current_task, self.current_request_id
             self.current_request_id = None
-            await _send_cmd(
-                self.ten_env, "abort", "llm", {"request_id": request_id}
-            )
-        if self.current_task:
-            self.current_task.cancel()
+            self.current_text = None
+            if task and task is not asyncio.current_task():
+                task.cancel()
+            try:
+                await self.input_queue.flush()
+                if request_id:
+                    await _send_cmd(
+                        self.ten_env, "abort", "llm", {"request_id": request_id}
+                    )
+            finally:
+                try:
+                    if task and task is not asyncio.current_task():
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                finally:
+                    if self.current_task is task:
+                        self.current_task = None
+                    self._flush_complete.set()
 
     async def stop(self) -> None:
-        """
-        Stop the LLMExec processing.
-        This will stop the input queue processing and any ongoing tasks.
-        """
         self.stopped = True
-        await self.flush()
-        if self.current_task:
-            self.current_task.cancel()
+        try:
+            await self.flush()
+        finally:
+            self._input_task.cancel()
+            try:
+                await self._input_task
+            except asyncio.CancelledError:
+                pass
 
     async def register_tool(self, tool: LLMToolMetadata, source: str) -> None:
         """
@@ -98,30 +118,32 @@ class LLMExec:
             self.tool_registry[tool.name] = source
 
     async def _process_input_queue(self):
-        """
-        Process the input queue for commands and data.
-        This method runs in a loop, processing items from the queue.
-        """
+        """Consume only input belonging to the post-flush generation."""
         while not self.stopped:
+            generation, text = await self.input_queue.get()
+            await self._flush_complete.wait()
+            if self.stopped:
+                return
+            if generation != self._request_generation:
+                continue
+            new_message = LLMMessageContent(role="user", content=text)
+            task = self.loop.create_task(
+                self._send_to_llm(self.ten_env, new_message, generation)
+            )
+            self.current_task = task
             try:
-                text = await self.input_queue.get()
-                new_message = LLMMessageContent(role="user", content=text)
-                self.current_task = self.loop.create_task(
-                    self._send_to_llm(self.ten_env, new_message)
-                )
-                await self.current_task
+                await task
             except asyncio.CancelledError:
+                # Cancellation is not a provider Done. Emitting a final here
+                # would resurrect a TTS request after its flush completed.
                 self.ten_env.log_info("LLMExec processing cancelled.")
-                text = self.current_text
-                self.current_text = None
-                if self.on_response and text:
-                    await self.on_response(self.ten_env, "", text, True)
-            except Exception as e:
+            except Exception:
                 self.ten_env.log_error(
                     f"Error processing input queue: {traceback.format_exc()}"
                 )
             finally:
-                self.current_task = None
+                if self.current_task is task:
+                    self.current_task = None
 
     async def _queue_context(
         self, ten_env: AsyncTenEnv, new_message: LLMMessage
@@ -149,11 +171,20 @@ class LLMExec:
             await self._queue_context(ten_env, new_message)
 
     async def _send_to_llm(
-        self, ten_env: AsyncTenEnv, new_message: LLMMessage
+        self,
+        ten_env: AsyncTenEnv,
+        new_message: LLMMessage,
+        generation: int | None = None,
     ) -> None:
+        generation = (
+            self._request_generation if generation is None else generation
+        )
+        if generation != self._request_generation:
+            return
         messages = self.contexts.copy()
         messages.append(new_message)
         request_id = str(uuid.uuid4())
+        previous_request_id = self.current_request_id
         self.current_request_id = request_id
         llm_input = LLMRequest(
             request_id=request_id,
@@ -165,20 +196,39 @@ class LLMExec:
         input_json = llm_input.model_dump()
         response = _send_cmd_ex(ten_env, "chat_completion", "llm", input_json)
 
-        # Queue the new message to the context
-        await self._queue_context(ten_env, new_message)
+        try:
+            await self._queue_context(ten_env, new_message)
+            async for cmd_result, _ in response:
+                # Abort can await transport while an old stream still produces
+                # genuine deltas/Done. None may cross that retired generation.
+                if generation != self._request_generation:
+                    return
+                if cmd_result and cmd_result.is_final() is False:
+                    if cmd_result.get_status_code() == StatusCode.OK:
+                        response_json, _ = cmd_result.get_property_to_json(None)
+                        ten_env.log_info(
+                            f"_send_to_llm: response_json {response_json}"
+                        )
+                        completion = parse_llm_response(response_json)
+                        await self._handle_llm_response(completion, generation)
+        finally:
+            # Tool-result requery is nested in the same turn. Restore its still
+            # live parent only when this request still owns the public handle.
+            if (
+                generation == self._request_generation
+                and self.current_request_id == request_id
+            ):
+                self.current_request_id = previous_request_id
+                self.current_text = None
 
-        async for cmd_result, _ in response:
-            if cmd_result and cmd_result.is_final() is False:
-                if cmd_result.get_status_code() == StatusCode.OK:
-                    response_json, _ = cmd_result.get_property_to_json(None)
-                    ten_env.log_info(
-                        f"_send_to_llm: response_json {response_json}"
-                    )
-                    completion = parse_llm_response(response_json)
-                    await self._handle_llm_response(completion)
-
-    async def _handle_llm_response(self, llm_output: LLMResponse | None):
+    async def _handle_llm_response(
+        self, llm_output: LLMResponse | None, generation: int | None = None
+    ):
+        generation = (
+            self._request_generation if generation is None else generation
+        )
+        if generation != self._request_generation:
+            return
         self.ten_env.log_info(f"_handle_llm_response: {llm_output}")
 
         match llm_output:
@@ -223,6 +273,8 @@ class LLMExec:
                     },
                 )
 
+                if generation != self._request_generation:
+                    return
                 if result.get_status_code() == StatusCode.OK:
                     r, _ = result.get_property_to_json(CMD_PROPERTY_RESULT)
                     tool_result: LLMToolResult = json.loads(r)
@@ -249,6 +301,7 @@ class LLMExec:
                                     call_id=llm_output.tool_call_id,
                                     type="function_call_output",
                                 ),
+                                generation,
                             )
                         else:
                             self.ten_env.log_error(

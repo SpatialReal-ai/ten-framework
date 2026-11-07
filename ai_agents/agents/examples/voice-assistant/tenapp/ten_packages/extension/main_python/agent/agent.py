@@ -28,6 +28,9 @@ class Agent:
             None  # currently running handler
         )
 
+        self._flush_lock = asyncio.Lock()
+        self._flush_complete = asyncio.Event()
+        self._flush_complete.set()
         self.llm_exec = LLMExec(ten_env)
         self.llm_exec.on_response = (
             self._on_llm_response
@@ -187,31 +190,42 @@ class Agent:
         Queue a new message to the LLM context.
         This method sends the text input to the LLM for processing.
         """
-        await self.llm_exec.queue_input(text)
+        await self._flush_complete.wait()
+        if not self.stopped:
+            await self.llm_exec.queue_input(text)
 
     async def flush_llm(self):
-        """
-        Flush the LLM input queue.
-        This will ensure that all queued inputs are processed.
-        """
-        await self.llm_exec.flush()
-
-        # Clear queue
-        while not self._llm_queue.empty():
+        """Seal producer output and old handlers before releasing fresh input."""
+        async with self._flush_lock:
+            self._flush_complete.clear()
             try:
-                self._llm_queue.get_nowait()
-                self._llm_queue.task_done()
-            except asyncio.QueueEmpty:
-                break
+                await self.llm_exec.flush()
+            finally:
+                try:
+                    # Producer abort may fail, but its generation is already
+                    # retired. Old queued/active handlers still need cleanup.
+                    while not self._llm_queue.empty():
+                        try:
+                            self._llm_queue.get_nowait()
+                            self._llm_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
 
-        # Cancel active LLM task
-        if self._llm_active_task and not self._llm_active_task.done():
-            self._llm_active_task.cancel()
-            try:
-                await self._llm_active_task
-            except asyncio.CancelledError:
-                pass
-            self._llm_active_task = None
+                    task = self._llm_active_task
+                    if (
+                        task
+                        and not task.done()
+                        and task is not asyncio.current_task()
+                    ):
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        if self._llm_active_task is task:
+                            self._llm_active_task = None
+                finally:
+                    self._flush_complete.set()
 
     async def stop(self):
         """
@@ -219,9 +233,19 @@ class Agent:
         This will stop the event queue and any ongoing tasks.
         """
         self.stopped = True
-        await self.llm_exec.stop()
-        await self.flush_llm()
-        if self._asr_consumer:
-            self._asr_consumer.cancel()
-        if self._llm_consumer:
-            self._llm_consumer.cancel()
+        try:
+            await self.llm_exec.stop()
+        finally:
+            try:
+                await self.flush_llm()
+            finally:
+                tasks = [self._asr_consumer, self._llm_consumer]
+                for task in tasks:
+                    if task and task is not asyncio.current_task():
+                        task.cancel()
+                for task in tasks:
+                    if task and task is not asyncio.current_task():
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass

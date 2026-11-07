@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from typing import Literal
+from dataclasses import dataclass, field
 
 from .agent.decorators import agent_event_handler
 from ten_runtime import (
@@ -25,6 +26,20 @@ from .config import MainControlConfig  # assume extracted from your base model
 import uuid
 
 
+# Bounds contain unfinished vendor segments, not a timeout or a turn detector.
+NOVA_MAX_SESSIONS = 8
+NOVA_MAX_SEGMENTS = 256
+NOVA_MAX_CHARACTERS = 32768
+
+
+@dataclass
+class _NovaUtterance:
+    parts: list[str] = field(default_factory=list)
+    characters: int = 0
+    interrupted: bool = False
+    overflow: bool = False
+
+
 class MainControlExtension(AsyncExtension):
     """
     The entry point of the agent module.
@@ -42,6 +57,8 @@ class MainControlExtension(AsyncExtension):
         self.sentence_fragment: str = ""
         self.turn_id: int = 0
         self.session_id: str = "0"
+        self._nova_utterances: dict[str, _NovaUtterance] = {}
+        self._nova_session_bound_reported = False
 
     def _current_metadata(self) -> dict:
         return {"session_id": self.session_id, "turn_id": self.turn_id}
@@ -75,6 +92,10 @@ class MainControlExtension(AsyncExtension):
     @agent_event_handler(UserLeftEvent)
     async def _on_user_left(self, event: UserLeftEvent):
         self._rtc_user_count -= 1
+        # UserLeftEvent has no speaker identity. Do not retain unfinished words
+        # across membership changes or join them to a replacement speaker.
+        self._nova_utterances.clear()
+        self._nova_session_bound_reported = False
 
     @agent_event_handler(ToolRegisterEvent)
     async def _on_tool_register(self, event: ToolRegisterEvent):
@@ -82,8 +103,18 @@ class MainControlExtension(AsyncExtension):
 
     @agent_event_handler(ASRResultEvent)
     async def _on_asr_result(self, event: ASRResultEvent):
+        if self.stopped:
+            return
         self.session_id = event.metadata.get("session_id", "100")
         stream_id = int(self.session_id)
+        info = event.metadata.get("asr_info")
+        if (
+            isinstance(info, dict)
+            and info.get("vendor") == "deepgram"
+            and info.get("api") == "listen_v1"
+        ):
+            await self._on_nova_result(event, info, stream_id)
+            return
         if not event.text:
             return
         if event.final or len(event.text) > 2:
@@ -92,6 +123,69 @@ class MainControlExtension(AsyncExtension):
             self.turn_id += 1
             await self.agent.queue_llm_input(event.text)
         await self._send_transcript("user", event.text, event.final, stream_id)
+
+    async def _on_nova_result(
+        self, event: ASRResultEvent, info: dict, stream_id: int
+    ) -> None:
+        """Nova finalizes segments; only speech_final ends a user utterance."""
+        session_id = self.session_id
+        state = self._nova_utterances.get(session_id)
+        if state is None:
+            if len(self._nova_utterances) >= NOVA_MAX_SESSIONS:
+                # Keep known sessions rather than evicting an unfinished prefix
+                # and later submitting a truncated suffix as a complete turn.
+                if not self._nova_session_bound_reported:
+                    self.ten_env.log_warn(
+                        "Nova utterance session limit reached"
+                    )
+                    self._nova_session_bound_reported = True
+                return
+            state = _NovaUtterance()
+            self._nova_utterances[session_id] = state
+
+        text = event.text.strip()
+        endpoint = info.get("speech_final") is True
+        if text and not state.interrupted and (event.final or len(text) > 2):
+            state.interrupted = True
+            await self._interrupt()
+            if (
+                self.stopped
+                or self._nova_utterances.get(session_id) is not state
+            ):
+                return
+
+        if not state.overflow:
+            size = state.characters + len(text) + bool(state.parts and text)
+            if size > NOVA_MAX_CHARACTERS or (
+                text and event.final and len(state.parts) >= NOVA_MAX_SEGMENTS
+            ):
+                state.overflow = True
+                state.parts.clear()
+                state.characters = 0
+                self.ten_env.log_warn(
+                    "Nova utterance buffer limit reached; discarding until endpoint"
+                )
+            elif text and event.final:
+                state.parts.append(text)
+                state.characters = size
+
+        if state.overflow:
+            if endpoint:
+                self._nova_utterances[session_id] = _NovaUtterance()
+            return
+
+        # Interim results replace the live suffix; they are never appended to
+        # the stable segment buffer. An empty endpoint still commits that buffer.
+        parts = state.parts + ([text] if text and not event.final else [])
+        combined = " ".join(parts)
+        if endpoint:
+            self._nova_utterances[session_id] = _NovaUtterance()
+            if not combined:
+                return
+            self.turn_id += 1
+            await self.agent.queue_llm_input(combined)
+        if combined:
+            await self._send_transcript("user", combined, endpoint, stream_id)
 
     @agent_event_handler(LLMResponseEvent)
     async def _on_llm_response(self, event: LLMResponseEvent):
@@ -121,6 +215,8 @@ class MainControlExtension(AsyncExtension):
     async def on_stop(self, ten_env: AsyncTenEnv):
         ten_env.log_info("[MainControlExtension] on_stop")
         self.stopped = True
+        self._nova_utterances.clear()
+        self._nova_session_bound_reported = False
         await self.agent.stop()
 
     async def on_cmd(self, ten_env: AsyncTenEnv, cmd: Cmd):
