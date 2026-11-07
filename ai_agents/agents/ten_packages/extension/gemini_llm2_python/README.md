@@ -22,6 +22,7 @@ Refer to the `api` definition in [manifest.json](manifest.json) and default valu
 | `temperature` | `float` | Sampling temperature, higher values mean more randomness |
 | `top_p` | `float` | Nucleus sampling parameter |
 | `max_tokens` | `int` | Maximum number of tokens to generate |
+| `reasoning_effort` | `string` | Optional provider thinking control; omitted by default |
 | `prompt` | `string` | System prompt for the model |
 
 > **Note**: If your API key is tied to Vertex AI, override `base_url` with your OpenAI-compatible endpoint, e.g. `https://us-central1-aiplatform.googleapis.com/v1beta/projects/<PROJECT_ID>/locations/us-central1/publishers/google/openai`.
@@ -37,6 +38,11 @@ export GEMINI_API_KEY=your_api_key
 ## Usage
 
 The extension uses Google's OpenAI-compatible endpoint at `https://generativelanguage.googleapis.com/v1beta/openai` to provide seamless integration with Gemini models.
+
+Set `reasoning_effort` only when the selected model supports it. For example,
+`"reasoning_effort": "none"` disables thinking for Gemini 2.5 Flash. Leaving it
+unset preserves the provider's default. Per-request `parameters` retain their
+existing precedence and can override this configured value.
 
 ### Gemini 3 Flash
 

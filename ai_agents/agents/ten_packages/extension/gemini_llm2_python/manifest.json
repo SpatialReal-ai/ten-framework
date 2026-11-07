@@ -50,6 +50,9 @@
         "max_tokens": {
           "type": "int32"
         },
+        "reasoning_effort": {
+          "type": "string"
+        },
         "prompt": {
           "type": "string"
         }

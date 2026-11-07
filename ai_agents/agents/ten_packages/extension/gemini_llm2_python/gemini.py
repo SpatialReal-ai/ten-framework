@@ -8,7 +8,7 @@
 from dataclasses import dataclass, field
 import json
 import time
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 from pydantic import BaseModel
 import httpx
 
@@ -35,6 +35,7 @@ class GeminiLLM2Config(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.95
     max_tokens: int = 4096
+    reasoning_effort: Optional[str] = None
     prompt: str = "You are a helpful assistant."
     black_list_params: List[str] = field(
         default_factory=lambda: ["messages", "tools", "stream", "model"]
@@ -178,6 +179,9 @@ class GeminiChatAPI:
                 "max_tokens": self.config.max_tokens,
                 "stream": request_input.streaming,
             }
+
+            if self.config.reasoning_effort is not None:
+                req["reasoning_effort"] = self.config.reasoning_effort
 
             # Only add tools if present
             if tools:
