@@ -41,6 +41,9 @@
         "base_url": {
           "type": "string"
         },
+        "native_text_api": {
+          "type": "bool"
+        },
         "temperature": {
           "type": "float32"
         },
