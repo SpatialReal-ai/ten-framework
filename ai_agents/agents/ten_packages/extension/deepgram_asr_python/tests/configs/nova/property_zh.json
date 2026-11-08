@@ -1,0 +1,12 @@
+{
+  "params": {
+    "api_key": "${env:DEEPGRAM_API_KEY}",
+    "url": "wss://api.deepgram.com/v1/listen",
+    "model": "nova-2",
+    "sample_rate": 16000,
+    "encoding": "linear16",
+    "language": "zh-CN",
+    "interim_results": true,
+    "utterance_end_ms": 1000
+  }
+}

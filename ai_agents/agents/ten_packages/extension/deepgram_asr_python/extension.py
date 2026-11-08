@@ -2,6 +2,7 @@ from datetime import datetime
 import os
 import asyncio
 import copy
+import math
 from typing import Dict, Any
 
 from typing_extensions import override
@@ -429,6 +430,31 @@ class DeepgramASRExtension(
                 if self.config.finalize_mode == "close_stream":
                     await self._finalize_end()
                 return
+            if (
+                not self.config.is_flux_model
+                and message_data.get("type") == "UtteranceEnd"
+            ):
+                word_end = self._nova_word_end_ms(
+                    message_data.get("last_word_end")
+                )
+                if word_end is not None:
+                    # A boundary marker carries no new transcript and is not
+                    # another finalized segment or a finalize acknowledgement.
+                    await self._handle_asr_result(
+                        text="",
+                        final=False,
+                        start_ms=word_end,
+                        duration_ms=0,
+                        language=self.config.asr_result_language,
+                        metadata=self._build_metadata_with_asr_info(
+                            {
+                                "api": "listen_v1",
+                                "message_type": "UtteranceEnd",
+                                "last_word_end_ms": word_end,
+                            }
+                        ),
+                    )
+                return
             # Extract basic fields
             if self.config.is_flux_model:
                 event = message_data.get("event", "")
@@ -489,6 +515,10 @@ class DeepgramASRExtension(
 
                 first_alt = alternatives[0]
                 result_to_send = first_alt.get("transcript", "")
+                words = first_alt.get("words") or []
+                word_end = self._nova_word_end_ms(
+                    words[-1].get("end") if words else None
+                )
 
                 # Extract timing information (in seconds, convert to milliseconds)
                 start_seconds = message_data.get("start", 0)
@@ -507,6 +537,7 @@ class DeepgramASRExtension(
                         "message_type": message_data.get("type", "Results"),
                         "is_final": is_final,
                         "speech_final": message_data.get("speech_final", False),
+                        "last_word_end_ms": word_end,
                     },
                 )
                 # Process ASR result
@@ -521,6 +552,22 @@ class DeepgramASRExtension(
 
         except Exception as e:
             self.ten_env.log_error(f"Error processing Deepgram result: {e}")
+
+    def _nova_word_end_ms(self, seconds: object) -> int | None:
+        """Map both result and gap markers onto the same user-audio timeline."""
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            return None
+        return int(
+            self.audio_timeline.get_audio_duration_before_time(
+                int(seconds * 1000)
+            )
+            + self.sent_user_audio_duration_ms_before_last_reset
+        )
 
     @override
     async def on_error(
