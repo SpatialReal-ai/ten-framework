@@ -23,6 +23,7 @@ Refer to the `api` definition in [manifest.json](manifest.json) and default valu
 | `top_p` | `float` | Nucleus sampling parameter |
 | `max_tokens` | `int` | Maximum number of tokens to generate |
 | `reasoning_effort` | `string` | Optional provider thinking control; omitted by default |
+| `native_text_api` | `bool` | Opt into the native text API; defaults to `false` |
 | `prompt` | `string` | System prompt for the model |
 
 > **Note**: If your API key is tied to Vertex AI, override `base_url` with your OpenAI-compatible endpoint, e.g. `https://us-central1-aiplatform.googleapis.com/v1beta/projects/<PROJECT_ID>/locations/us-central1/publishers/google/openai`.
@@ -43,6 +44,22 @@ Set `reasoning_effort` only when the selected model supports it. For example,
 `"reasoning_effort": "none"` disables thinking for Gemini 2.5 Flash. Leaving it
 unset preserves the provider's default. Per-request `parameters` retain their
 existing precedence and can override this configured value.
+
+### Native text streaming
+
+For text-only assistants, set `native_text_api: true` and `base_url` to
+`https://generativelanguage.googleapis.com/v1beta`. Authentication uses the API
+key header. Both streaming and non-streaming text use the existing TEN LLM2
+response contract. Streaming starts with the first text event and ends at the
+provider's terminal event; cancelling or closing the consumer releases HTTP
+resources immediately.
+
+This opt-in path supports text system/user/assistant history, `temperature`,
+`top_p`, `max_tokens` and `reasoning_effort: none` (Gemini 2.5 thinking budget 0).
+Omit reasoning control to retain the model default. Tools, multimodal input,
+other reasoning values and unsupported parameters are rejected explicitly.
+Use the default compatible path for those features. A blocked or incomplete
+native stream raises an error instead of reporting a successful completion.
 
 ### Gemini 3 Flash
 

@@ -176,6 +176,7 @@ def make_api(bridge, response):
         top_p=0.9,
         max_tokens=100,
         reasoning_effort=None,
+        native_text_api=False,
         is_black_list_params=lambda _key: False,
     )
     api.http_client = SyntheticHTTPClient(response)
