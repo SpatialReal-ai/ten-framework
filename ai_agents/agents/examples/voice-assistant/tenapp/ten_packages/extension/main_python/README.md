@@ -51,11 +51,15 @@ characters, with at most eight retained sessions. Overflow discards that whole
 utterance until its actual endpoint and emits a warning without transcript text;
 the next utterance can proceed. User leave and stop clear unfinished state. This
 consumer does not synthesize an endpoint from silence timers or punctuation.
-This Nova path requires provider endpointing to be enabled so that `speech_final`
-is emitted (the demo uses Deepgram's enabled default). If that boundary is absent,
-locked/finalized segments are not promoted to a fabricated utterance EOF.
-`UtteranceEnd` is not currently forwarded by the Nova provider adapter and is not
-used as an implicit fallback here.
+Provider endpointing remains the fast path. When the Nova adapter also forwards
+`message_type: UtteranceEnd`, its `last_word_end_ms` must exactly match both the
+last pending finalized word and the latest recognized word. Only then can that
+explicit provider gap release an otherwise unfinished utterance. Duplicate,
+negative, unknown and stale markers do not submit text; newer interim speech
+prevents an older gap from cutting the current utterance. No local silence timer
+or punctuation heuristic is used. Enable the optional provider gap with
+`params.utterance_end_ms: 1000` and `interim_results: true`; normal
+`speech_final` results still submit immediately.
 
 ### Output Data
 

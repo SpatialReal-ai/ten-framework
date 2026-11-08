@@ -38,6 +38,8 @@ class _NovaUtterance:
     characters: int = 0
     interrupted: bool = False
     overflow: bool = False
+    last_final_word_end_ms: int | None = None
+    latest_word_end_ms: int | None = None
 
 
 class MainControlExtension(AsyncExtension):
@@ -127,7 +129,7 @@ class MainControlExtension(AsyncExtension):
     async def _on_nova_result(
         self, event: ASRResultEvent, info: dict, stream_id: int
     ) -> None:
-        """Nova finalizes segments; only speech_final ends a user utterance."""
+        """Assemble segments until an endpoint or a matching provider gap."""
         session_id = self.session_id
         state = self._nova_utterances.get(session_id)
         if state is None:
@@ -145,6 +147,20 @@ class MainControlExtension(AsyncExtension):
 
         text = event.text.strip()
         endpoint = info.get("speech_final") is True
+        word_end = info.get("last_word_end_ms")
+        valid_end = type(word_end) is int and word_end >= 0
+        if info.get("message_type") == "UtteranceEnd":
+            # A delayed gap must not commit a newer interim/final suffix, and
+            # a second marker must not re-submit an already completed turn.
+            endpoint = (
+                valid_end
+                and word_end == state.last_final_word_end_ms
+                and word_end == state.latest_word_end_ms
+            )
+        elif text:
+            state.latest_word_end_ms = word_end if valid_end else None
+            if event.final:
+                state.last_final_word_end_ms = state.latest_word_end_ms
         if text and not state.interrupted and (event.final or len(text) > 2):
             state.interrupted = True
             await self._interrupt()

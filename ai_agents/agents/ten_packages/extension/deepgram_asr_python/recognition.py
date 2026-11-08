@@ -115,7 +115,7 @@ class DeepgramASRRecognition:
 
             message_type = message_data.get("type")
             if self.is_flux_model == False:
-                if message_type in {"Results", "Metadata"}:
+                if message_type in {"Results", "Metadata", "UtteranceEnd"}:
                     await self.callback.on_result(message_data)
             else:
                 if message_type == "TurnInfo":

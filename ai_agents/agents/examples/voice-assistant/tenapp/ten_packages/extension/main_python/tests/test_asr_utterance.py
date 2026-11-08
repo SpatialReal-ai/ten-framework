@@ -67,6 +67,18 @@ def nova(text, final=False, endpoint=False, session="100"):
     )
 
 
+def timed_nova(text, word_end, final=False, endpoint=False):
+    event = nova(text, final, endpoint)
+    event.metadata["asr_info"]["last_word_end_ms"] = word_end
+    return event
+
+
+def utterance_end(word_end):
+    event = timed_nova("", word_end)
+    event.metadata["asr_info"]["message_type"] = "UtteranceEnd"
+    return event
+
+
 class TestASRUtterance(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.transport = Transport()
@@ -89,6 +101,50 @@ class TestASRUtterance(unittest.IsolatedAsyncioTestCase):
 
     def flushes(self):
         return self.transport.events.count(("llm_flush",))
+
+    async def test_missing_speech_final_uses_matching_provider_gap_once(self):
+        await self.send(timed_nova(FIRST, 1000, final=True))
+        self.assertEqual(self.controller.agent.inputs, [])
+        await self.send(utterance_end(1000), utterance_end(1000))
+        await self.send(nova("", True, True))
+        self.assertEqual(self.controller.agent.inputs, [FIRST.strip()])
+        self.assertEqual(self.controller.turn_id, 1)
+
+    async def test_late_gap_does_not_cut_newer_interim_or_final_words(self):
+        await self.send(
+            timed_nova(FIRST, 1000, final=True),
+            timed_nova("second", 1500),
+            utterance_end(1000),
+        )
+        self.assertEqual(self.controller.agent.inputs, [])
+        await self.send(
+            timed_nova(SECOND, 2000, final=True), utterance_end(1000)
+        )
+        self.assertEqual(self.controller.agent.inputs, [])
+        await self.send(utterance_end(2000))
+        self.assertEqual(self.controller.agent.inputs, [FIRST + SECOND])
+
+    async def test_invalid_or_unmatched_gap_never_submits_partial_text(self):
+        await self.send(timed_nova(FIRST, 1000))
+        await self.send(utterance_end(1000))
+        self.assertEqual(self.controller.agent.inputs, [])
+        await self.send(timed_nova(FIRST, 1000, final=True))
+        for value in (None, -1, True, 999, 1001):
+            await self.send(utterance_end(value))
+        self.assertEqual(self.controller.agent.inputs, [])
+        await self.send(utterance_end(1000))
+        self.assertEqual(self.controller.agent.inputs, [FIRST.strip()])
+
+    async def test_normal_endpoint_does_not_wait_for_gap_or_duplicate_it(self):
+        await self.send(timed_nova(FIRST, 1000, final=True, endpoint=True))
+        self.assertEqual(self.controller.agent.inputs, [FIRST.strip()])
+        await self.send(utterance_end(1000))
+        await self.send(
+            timed_nova(SECOND, 2000, final=True), utterance_end(1000)
+        )
+        self.assertEqual(self.controller.agent.inputs, [FIRST.strip()])
+        await self.send(utterance_end(2000))
+        self.assertEqual(self.controller.agent.inputs, [FIRST.strip(), SECOND])
 
     async def test_segment_finals_make_one_complete_llm_input(self):
         self.assertEqual((len(FIRST), len(SECOND)), (18, 15))
